@@ -111,3 +111,10 @@ ENV/
 .vscode/
 .vs/
 © 2019 GitHub, Inc.
+
+package.json
+package-lock.json
+
+/notes
+.idea/
+.DS_Store
