@@ -6,6 +6,296 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.5.0] - 2026-09-11
+
+### Changed
+
+- `predict(..., return_matrix=True)` on a multitask model now returns a
+  `FactoredPredictionMatrix` instead of a dense array. `FactorHead` ends with
+  `proj(trunk) @ embedding.T * scale + shift`, so the `(n_peptides, n_tasks)` matrix is
+  determined by `(n_peptides, rank)`: at rank 64 and 6,543 setups that is 102 times less
+  memory, 0.6 GiB instead of 63 GiB for 2.6 million peptides. It reports the same shape and
+  indexes the same way, selecting rows alone gives another factored matrix, and anything it
+  cannot answer from the factors falls through to the dense matrix, so callers that reduce
+  over the result rather than slicing it are unaffected. Pass
+  `predict_kwargs={"factored": False}` for the dense array.
+- `MultiHeadCalibration.fit` no longer expands a lazy source. Head ranking already walked the
+  heads in blocks and every later step reads single columns, so a reference of every
+  confidently identified PSM in a large search no longer has to fit in memory at full width.
+  Block size is now chosen from the row count, holding the peak near 64 MiB whether the
+  reference has a thousand rows or a million.
+
+### Fixed
+
+- Predicting no longer collects every batch in a list and concatenates at the end, which
+  needed the result twice over and only failed once all the work was done. The output is
+  allocated once and filled in place, and an output that does not fit reports its size and
+  points at `task_idx` rather than surfacing a bare allocator failure.
+
+## [4.4.0] - 2026-09-09
+
+### Added
+
+- `prediction_report`: predictions with provenance and uncertainty per PSM. Returns a
+  DataFrame with, next to `predicted_rt`: a conformal prediction interval (`ci_lower`,
+  `ci_upper`) at a chosen coverage, exact-match membership against the calibration reference
+  (`in_reference`) and the Levenshtein distance to the closest reference sequence
+  (`dist_to_reference`); with a training index also membership in the corpus the bundled
+  multitask model was trained on (`in_training`), membership within the training sets of the
+  setups the calibration selected (`in_selected_heads_training`) and the distance to the
+  closest training sequence (`dist_to_training`, exact up to 10 and capped beyond).
+
+  The interval is cross-fitted split-conformal on the reference: the reference is split into
+  folds, each fold is predicted by a calibration fitted on the other folds, and the half-width
+  is a finite-sample quantile of those honest residuals per predicted-RT bin. On eight PRIDE
+  setups no DeepLC model was trained on, the empirical coverage of the 90 % interval was 0.88
+  to 0.97 per setup (median 0.91), with widths from 4 % of the gradient on well-behaved setups
+  to 79 % on a run that pools several fractions. Coverage is marginal, not per-peptide.
+
+  With a multi-head calibration the width is also **per peptide** (`per_peptide_width`, on by
+  default): the residuals are divided by how far the combined setup heads lie apart for that
+  peptide before the quantile is taken, and multiplied by it again at prediction time. Two
+  peptides predicted at the same retention time therefore no longer share one interval. On the
+  six held-out setups this raised the worst conditional slice from 0.851 to 0.882 and the
+  Spearman correlation between width and error from 0.15 to 0.25, for 10 % wider intervals;
+  the largest gains are on the setups where the RT-only width was weakest. Set
+  `per_peptide_width=False` for widths that depend on the predicted retention time alone.
+
+- `Calibration.disagreement`, the per-input uncertainty a calibration can report, implemented
+  by `MultiHeadRidgeCalibration` as the ridge-weighted spread of its calibrated head
+  estimates and returning None elsewhere.
+
+- `TrainingIndex`: an index of the multitask training corpus (10,105,640 canonical
+  peptidoform keys, their 65,139,832 setup observations, 6,157,558 unique stripped sequences).
+  Distributed separately from the package as a single 105 MB `.dlcidx` file: an LZMA zip
+  holding 40-bit key hashes in a bucketed layout (false positive about once per 100,000
+  membership queries, irrelevant for a provenance flag), per-key setup lists and the unique
+  sequences. A raw memory-mapped directory form with exact 64-bit hashes is read as well.
+  `prediction_report` takes either as an optional argument and works without one.
+
+- Dependency: `rapidfuzz` (Levenshtein distances).
+
+## [4.3.0] - 2026-09-02
+
+### Added
+
+- `deeplc.calibration` is now a package. `deeplc.calibration.simple` holds the naive,
+  single-series calibrations unchanged (`Calibration` ABC, `IdentityCalibration`,
+  `PiecewiseLinearCalibration`, `SplineTransformerCalibration`). New
+  `deeplc.calibration.multihead` holds `MultiHeadCalibration`, the ABC for a calibration that
+  takes the whole `(n, n_heads)` prediction matrix `predict(..., return_matrix=True)` returns and
+  selects its own head(s): `MultiHeadPiecewiseLinearCalibration` and `MultiHeadSplineCalibration`
+  rank heads by Pearson correlation and delegate to the matching naive class on the winner, and
+  `MultiHeadRidgeCalibration` combines several best-correlating heads with a ridge fit. All three
+  are re-exported from `deeplc.calibration`, unchanged import path for existing names.
+
+  On the eight PRIDE setups that no DeepLC model was trained on, `MultiHeadRidgeCalibration`
+  lowered the held-out error on all eight, by a median of 13 % relative to the observed gradient.
+
+- `deeplc.calibration.upgrade_calibration`, wrapping an unfitted naive `Calibration` in its
+  `MultiHead*Calibration` counterpart. `calibrate()` and `predict_and_calibrate()` call it on
+  whatever `calibration` they are given, so passing a naive instance (e.g.
+  `SplineTransformerCalibration()`) still works, calibrated on the best-correlating head instead
+  of head 0. A fitted naive instance is rejected: it carries no record of which head it was fit
+  on, so fit a `MultiHead*Calibration` instead in that case.
+
+### Changed
+
+- `calibrate()` and `predict_and_calibrate()` default to `MultiHeadRidgeCalibration()` for every
+  model, single-task included (it reduces to a spline plus a linear rescaling on one column). Pass
+  `MultiHeadSplineCalibration()` or `MultiHeadPiecewiseLinearCalibration()` for a lighter
+  calibration. `Calibration.selected_model_head`/`uses_all_heads` are gone: head selection now
+  lives entirely in the `MultiHeadCalibration` implementations.
+
+  **Breaking**: an already-fitted naive `Calibration` passed directly to
+  `predict_and_calibrate()` is now rejected; fit a `MultiHead*Calibration` instead.
+
+### Fixed
+
+- `IdentityCalibration()` could not be instantiated: it never overrode the abstract
+  `Calibration.__init__`.
+
+## [4.2.0] - 2026-08-28
+
+### Changed
+
+- Calibration and fine-tuning now use **one PSM per peptidoform**, the first observation in
+  the reference. A reference built from a search result repeats a peptidoform once per
+  spectrum it was identified in, each time with a different observed retention time, so the
+  fit was given conflicting targets and weighed peptidoforms by how often they happened to be
+  identified. On a reported MS2Rescore case (201,593 PSMs, one run) the reference selected by
+  auto-calibration held 6,331 PSMs but only 2,623 peptidoforms; the repeats of one peptidoform
+  disagreed on the observed retention time by 236 s, two thirds of the 354 s range covered by
+  the identifications. Fitting on the first observations improved the calibration on those
+  2,623 peptidoforms from 9.69 to 4.51 s mean absolute error (median 5.98 to 2.09 s; within
+  5 s 44.9 % to 81.4 %). Retention times are in whatever unit the input uses; DeepLC does not
+  convert them.
+
+  Charge states of one peptidoform count as repeats, since retention time does not depend on
+  precursor charge. When repeats disagree by a large fraction of the observed range, DeepLC
+  now says so: that means the reference mixes runs or contains low-confidence PSMs, which
+  deduplication hides rather than fixes.
+
+  There is no option for it: the public functions keep the signature they had. A caller who
+  really wants every reference PSM to count fits a `Calibration` on its own targets and passes
+  it to `predict_and_calibrate`, which uses an already fitted calibration as given; `train`
+  remains available for full control over a training set.
+
+### Added
+
+- `deeplc._reference_selection.deduplicate_psms`, which returns the first PSM of every
+  peptidoform in a `PSMList`.
+
+## [4.1.1] - 2026-08-26
+
+### Changed
+
+- The default model is now the fused-trunk multitask model trained across 6,543 LC
+  setups (`multitask_flexcnn_model.pt`, bundled since 4.1.0 as an opt-in). Every core
+  function and the command line use it when no `model` is given. The 4.0 default,
+  `multitask_model.pt`, stays bundled as `deeplc.core.LEGACY_MULTITASK_MODEL`; pass it
+  as `model=` to reproduce 4.0 and 4.1.0 predictions exactly.
+- Uncalibrated `predict()` on a multitask model that carries setup names reports the
+  setup named by `deeplc.core.DEFAULT_TASK_NAME` (`PXD005573_mcp`, the 200-minute
+  gradient the DeepLC 1.x to 3.x models were trained on) instead of head 0, which for
+  the new default was an arbitrary setup. `return_matrix=True` is unchanged, and so are
+  calibration and fine-tuning, which select or fit the setup from the reference.
+
+## [4.1.0] - 2026-08-20
+
+### Added
+
+- `legacy_positional_deltas`, on `encode_peptidoform` and `DeepLCDataset`, reproducing
+  the placement of modification deltas in the positional block exactly as versions
+  before 4.0.1 did. Verified bit-identical to a v4.0.0 checkout across 4,760 feature
+  arrays from 1,190 peptidoforms covering lengths 2 to 70, every modified position, and
+  terminal modifications. Unmodified peptidoforms are unaffected either way.
+- The feature layout a model expects is now resolved from the specification it carries,
+  in one place. A checkpoint that records no specification was written before 4.1.0, so
+  it also predates the 4.0.1 correction and is fed the encoding it was trained on. One
+  that records a specification is read literally, and every checkpoint this version
+  writes records the encoding it used. `DeepLCDataset` therefore defaults to the
+  pre-4.0.1 placement, since a dataset exists to feed a model; `encode_peptidoform`,
+  whose job is correct featurisation, still defaults to the corrected placement.
+  Newly trained models get the corrected placement.
+
+### Fixed
+
+- Predictions from models trained before the 4.0.1 feature correction no longer change.
+  4.0.1 corrected where modification deltas land in the positional block, which altered
+  the encoding of every modified peptidoform, while every model released up to that
+  point had been trained on the old encoding. Modified peptides were therefore predicted
+  from input those models had never seen. All five bundled checkpoints are bare state
+  dicts and are now recognised as predating the correction, so their predictions match
+  v4.0.0 exactly again, with no retraining and no change to any calling code.
+
+  This also covers models held by downstream packages. IM2Deep 2.0.2, unmodified,
+  reproduces its v4.0.0 CCS predictions exactly on this release; under 4.0.1 its modified
+  peptides had shifted by up to 7.6 A^2. Note that this means predictions for such models
+  differ from 4.0.1, which is the point: 4.0.1's change to them was not intended.
+
+- Fine-tuning onto a new LC setup for models with a low-rank multitask head, fitting the
+  setup's own `rank + 2` parameters with the encoder and pretrained setups frozen: 66
+  values at rank 64, against roughly 1.7 million for an adapter over a 6,543-wide head
+  vector. `finetune()` previously refused this architecture.
+- `MIN_FINETUNE_REFERENCE`, with a warning when fine-tuning is attempted on fewer
+  reference PSMs. Measured on six unseen LC setups, fine-tuning was worse than
+  calibration below roughly 500 reference peptidoforms and better above 700; the
+  validation split is widened automatically below the threshold so early stopping has
+  signal to work with.
+- The new setup's `scale` and `shift` are solved by least squares on the reference data
+  before training, rather than learned. Left to the optimiser on a small reference set
+  they collapse: on a 133-minute gradient with 230 reference peptides the output range
+  shrank to 17 minutes and the error reached 91 minutes, with the correlation still above
+  0.9 because the ordering was never what broke. Anchoring them brought that setup to
+  2.2 minutes.
+
+- Fused-trunk multitask architecture (`FlexCNNMultitaskModel`), which merges atomic
+  composition with a learned residue embedding in a single convolutional trunk and pools
+  over the valid length instead of flattening four separate branches. Available as
+  `deeplc.core.FLEXCNN_MULTITASK_MODEL`; the bundled model was trained across 6,543 LC
+  setups and reaches 0.82 min test MAE and 0.24 min median against 1.26 min and 0.51 min
+  for the four-branch backbone on the same data and the same head.
+- `FactorHead`, a low-rank multitask head where a setup owns only `rank + 2` parameters,
+  so adding an LC setup means fitting 66 values with the encoder frozen rather than
+  training a head.
+- Self-describing checkpoints. A model file may now record its architecture, constructor
+  arguments, feature specification and target units, so loading no longer infers the
+  architecture from tensor shapes. Bare state dicts continue to load unchanged.
+- `add_terminal_composition` on `DeepLCDataset` and `DeepLCDataset.from_psm_list`,
+  passed through to `encode_peptidoform`.
+
+### Fixed
+
+- Fine-tuning could return a model far worse than the one it started from. Three
+  defects compounded: `train()` began with an infinite best validation loss, so the
+  first epoch always became the best however bad it was; the output layer's scale was
+  learned rather than solved, though it is linear in its input; and the adapter's ReLU
+  stack is largely dead at its default initialisation, which left the activations rank
+  deficient and made a CUDA least-squares solve return non-finite values and silently
+  decline. On a 133-minute gradient with 230 reference peptides the adapter path
+  returned predictions spanning 1.3 to 27.2 minutes at an error of 92 minutes, with
+  the correlation still above 0.9 because only the scale was lost. Training now scores
+  its starting point, both adaptation paths solve their output layer on the reference
+  data first, and that solve is rank tolerant. The same setup now gives 1.63 minutes
+  for the adapter path and 2.05 for the low-rank head, against 1.47 and 1.28 for
+  calibration.
+- A fine-tuned model whose validation error exceeds a large fraction of the reference
+  retention-time span is now reported at error level, since a collapsed fit leaves the
+  loss curve and the correlation looking unremarkable.
+
+### Changed
+
+- `predict()` loads the model before encoding features, so a model that records a feature
+  specification gets the features it was trained on. Previously the dataset was always
+  built with defaults.
+
+## [4.0.0] - 2026-07-24
+
+### Changed
+
+- Default epochs for finetuning to 50
+
+## [4.0.0b1] - 2026-07-10
+
+### Added
+
+- Bundled multitask pretrained model as the new default, trained across multiple LC setups. Automatic head selection in `calibrate()` based on Pearson correlation ensures the best fitting setup is used for predictions. Fine-tuning uses adapter-based transfer learning: a small MLP is attached on top of the multi-setup prediction heads.
+- NiceGUI-based web interface, launchable as a browser app (`deeplc gui`) or native desktop window (`deeplc gui --native`)
+- `[gui]` optional dependency group (nicegui, plotly, pywebview) for desktop use
+- `[web]` optional dependency group (nicegui, plotly) for server/Docker use
+- Docker image for containerized web server deployment
+- Updated Windows installer (PyInstaller and Inno Setup) to new GUI
+- `predict_and_calibrate()` core function combining prediction and calibration in one call, with optional automatic reference PSM selection
+- `finetune_and_predict()` core function for transfer learning followed by calibrated prediction
+- Automatic calibration reference selection from input PSMs using q-value filtering or top-scoring fraction
+- `Calibration.selected_model_head` field to record which model output head a calibration was fitted to
+- Publish workflow with Windows installer build, Docker image build, and dry-run mode for CI testing without publishing
+
+### Changed
+
+- CLI restructured into `predict` and `gui` subcommands
+- Example datasets updated from legacy CSV format to psm_utils TSV and peprec formats
+
+## [4.0.0-alpha.1]
+
+### Changed
+
+- Simplified the public package API by splitting up the single class-based API into core functions (`predict`, `finetune`, `train`, etc.)
+- Switched deep learning framework from Tensorflow to PyTorch
+- Speed up predictions by removing ensemble method where output from three models with differing kernel sizes was averaged to one prediction
+- Separated calibration logic to dedicated reusable module with sklearn-like API.
+- Improved computational efficiency of piece-wise linear calibration and set sensible default parameters
+- Built-in transfer learning functionality, instead of using external `deeplcretrainer` package.
+- Cleaned up package, removing legacy and unused code and files, and improving modularity
+- Modernized CI workflows to use `uv`
+- Added sphinx-based documentation for readthedocs
+
+### Removed
+
+- Removed library-feature for storing past predictions
+- Removed legacy CALLC functionality
+
 ## [3.1.13] - 2025-09-01
 
 ### Changed
@@ -71,7 +361,6 @@ and this project adheres to
 ### Changed
 
 - Bioconda fix import
-
 
 ## [3.1.2] - 2024-11-21
 
@@ -532,7 +821,7 @@ and this project adheres to
 - CLI: Restructured help message
 - Made DeepLC class API docstring consistent with CLI help message
 - Docs: Moved `dict_divider` and `split_cal` explanation to README Q&A section.
-- CI: Only run tests on commits to `master` or from a PR
+- CI: Only run tests on commits to `main` or from a PR
 - Refactoring: Cleaned up `__main__.py`
 - Logging: Changed some loggings from DEBUG to INFO level, some from WARNING to INFO or
   DEBUG level
